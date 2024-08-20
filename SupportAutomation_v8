@@ -1,0 +1,274 @@
+import base64
+import requests
+from openai import OpenAI
+import time
+import subprocess
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Freshservice API Details
+api_key = ""
+encoded_api_key = base64.b64encode(f"{api_key}:".encode()).decode()
+
+headers = {
+    'Authorization': f'Basic {encoded_api_key}',
+    'Content-Type': 'application/json'
+}
+
+FRESHSERVICE_DOMAIN = 'belsolutions.freshservice.com'
+API_URL = f'https://{FRESHSERVICE_DOMAIN}/api/v2/tickets'
+
+# Temporary RAG Cache
+rag_cache = {}
+
+# Setup for OpenAI Studio
+client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+
+# Function to fetch open tickets
+def fetch_open_tickets():
+    try:
+        response = requests.get(API_URL, headers=headers, verify=False)
+        response.raise_for_status()
+        tickets = response.json().get('tickets', [])
+        open_tickets = [ticket for ticket in tickets if ticket.get('status') == 2]
+        logger.info(f"Fetched {len(open_tickets)} open tickets.")
+        return open_tickets
+    except requests.RequestException as e:
+        logger.error(f"Error fetching tickets: {e}")
+        return []
+
+# Function to retrieve the last user reply in the conversation history of a ticket
+def get_last_user_reply(ticket_id):
+    if ticket_id in rag_cache and 'last_user_reply' in rag_cache[ticket_id]:
+        return rag_cache[ticket_id]['last_user_reply']
+    
+    try:
+        # URL to list all conversations of the ticket
+        conversations_url = f'{API_URL}/{ticket_id}/conversations'
+        logger.info(f"Making API request to: {conversations_url}")
+        
+        response = requests.get(conversations_url, headers=headers, verify=False)
+        response.raise_for_status()
+
+        # Access the conversations list from the response
+        response_data = response.json()
+        conversations = response_data.get('conversations', [])
+
+        if not isinstance(conversations, list):
+            logger.error(f"Unexpected data format for conversation history: {response_data}")
+            return ""
+        
+        # Log the full conversation data for debugging
+        logger.info(f"Full conversation data for ticket ID {ticket_id}: {conversations}")
+
+        # Sort the conversations by `created_at` in descending order to get the most recent first
+        conversations.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+        # Find the most recent user reply
+        last_user_reply = ""
+        for convo in conversations:
+            if isinstance(convo, dict) and convo.get('incoming'):  # Check for user reply
+                body_text = convo.get('body_text', '').strip() or convo.get('body', '').strip()
+                if body_text:
+                    last_user_reply = body_text
+                    logger.info(f"Most recent user reply found: {last_user_reply}")
+                    break
+
+        if last_user_reply:
+            rag_cache[ticket_id]['last_user_reply'] = last_user_reply
+        else:
+            logger.warning(f"No valid user reply found for ticket ID {ticket_id}. Defaulting to empty string.")
+        
+        return last_user_reply
+        
+    except requests.RequestException as e:
+        logger.error(f"Error retrieving ticket data for ticket ID {ticket_id}: {e}")
+        return ""
+    except ValueError as e:
+        logger.error(f"Error parsing JSON response for ticket ID {ticket_id}: {e}")
+        return ""
+
+
+
+def get_last_user_reply(ticket_id):
+    if ticket_id in rag_cache and 'last_user_reply' in rag_cache[ticket_id]:
+        return rag_cache[ticket_id]['last_user_reply']
+    
+    try:
+        # URL to list all conversations of the ticket
+        conversations_url = f'{API_URL}/{ticket_id}/conversations'
+        logger.info(f"Making API request to: {conversations_url}")
+        
+        response = requests.get(conversations_url, headers=headers, verify=False)
+        response.raise_for_status()
+
+        # Access the conversations list from the response
+        response_data = response.json()
+        conversations = response_data.get('conversations', [])
+
+        if not isinstance(conversations, list):
+            logger.error(f"Unexpected data format for conversation history: {response_data}")
+            return ""
+        
+        # Log the full conversation data for debugging
+        logger.info(f"Full conversation data for ticket ID {ticket_id}: {conversations}")
+
+        # Initialize variable to track the latest user reply
+        last_user_reply = ""
+        latest_timestamp = None
+
+        for convo in conversations:
+            if isinstance(convo, dict) and convo.get('incoming'):  # Check for user reply
+                created_at = convo.get('created_at')
+                body_text = convo.get('body_text', '').strip() or convo.get('body', '').strip()
+
+                if created_at and body_text:
+                    # Compare timestamps to find the latest
+                    if not latest_timestamp or created_at > latest_timestamp:
+                        latest_timestamp = created_at
+                        last_user_reply = body_text
+                        logger.info(f"Latest user reply found at {created_at}: {last_user_reply}")
+
+        if last_user_reply:
+            rag_cache[ticket_id]['last_user_reply'] = last_user_reply
+        else:
+            logger.warning(f"No valid user reply found for ticket ID {ticket_id}. Defaulting to empty string.")
+        
+        return last_user_reply
+        
+    except requests.RequestException as e:
+        logger.error(f"Error retrieving ticket data for ticket ID {ticket_id}: {e}")
+        return ""
+    except ValueError as e:
+        logger.error(f"Error parsing JSON response for ticket ID {ticket_id}: {e}")
+        return ""
+
+
+
+
+
+
+
+# Function to generate text embeddings
+def generate_embeddings(text):
+    # Check if the embedding is already cached
+    if text in rag_cache:
+        return rag_cache[text]['embedding']
+    
+    try:
+        response = requests.post(
+            "http://localhost:1234/v1/embeddings",
+            json={"model": "embedding-model-identifier", "input": text},
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        response.raise_for_status()
+        embedding = response.json().get('data', [])[0].get('embedding', [])
+        rag_cache[text] = {'embedding': embedding}
+        logger.info(f"Generated embeddings for text: {text[:30]}...")
+        return embedding
+    except requests.RequestException as e:
+        logger.error(f"Error generating embeddings: {e}")
+        return []
+
+# Function to use GraphRAG for gaining additional context
+def get_graphrag_context(query):
+    if query in rag_cache:
+        return rag_cache[query]['graphrag_context']
+    
+    try:
+        result = subprocess.run(
+            ['python3', '-m', 'graphrag.query', '--root', '.', '--method', 'global', query],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        context = result.stdout.strip()
+        rag_cache[query] = {'graphrag_context': context}
+        logger.info(f"GraphRAG context retrieved for query: {query[:30]}...")
+        return context
+    except subprocess.SubprocessError as e:
+        logger.error(f"Error using GraphRAG: {e}")
+        return ""
+
+# Function to generate AI response using Studio, incorporating the last reply for context
+# Function to generate AI response using Studio, prioritizing the latest reply
+def generate_response(ticket, context):
+    last_user_reply = get_last_user_reply(ticket['id'])  # Ensure we get the latest user reply
+    
+    # Adjusted system prompt to focus on the latest user input
+    history = [
+        {"role": "system", "content": "You are an intelligent assistant. You always provide well-reasoned answers that are both correct and helpful. Focus primarily on the user's most recent reply and provide a response that directly addresses their current needs or questions."},
+        {"role": "user", "content": f"Ticket: {ticket['subject']}\nDetails: {ticket['description']}\nLast User Reply: {last_user_reply}"}
+    ]
+    
+    # Append additional context from GraphRAG if relevant
+    if context:
+        history.append({"role": "assistant", "content": f"Additional Context: {context}"})
+    
+    try:
+        completion = client.chat.completions.create(
+            model="model-identifier",  # Replace with your model identifier
+            messages=history,
+            temperature=0.7,
+            stream=True,
+        )
+        
+        response = ""
+        for chunk in completion:
+            if chunk.choices[0].delta.content:
+                response += chunk.choices[0].delta.content
+        
+        logger.info(f"Generated response for ticket ID {ticket['id']}.")
+        return response
+    except Exception as e:
+        logger.error(f"Error generating response: {e}")
+        return ""
+
+
+# Function to reply to a ticket by adding a public note and setting status to "Pending"
+def reply_to_ticket(ticket_id, response_content):
+    try:
+        # Add a public note
+        data = {'body': response_content, 'private': False}
+        reply_response = requests.post(f'{API_URL}/{ticket_id}/notes', headers=headers, json=data, verify=False)
+        reply_response.raise_for_status()
+
+        # Update ticket status to "Pending"
+        update_data = {'status': 3}
+        update_response = requests.put(f'{API_URL}/{ticket_id}', headers=headers, json=update_data, verify=False)
+        update_response.raise_for_status()
+        
+        logger.info(f"Successfully replied to ticket ID {ticket_id} and updated status to Pending.")
+    except requests.RequestException as e:
+        logger.error(f"Error replying to ticket ID {ticket_id}: {e}")
+
+# Main Loop
+def main_loop():
+    while True:
+        tickets = fetch_open_tickets()
+        for ticket in tickets:
+            ticket_id = ticket['id']
+            
+            if ticket_id not in rag_cache:
+                # Cache new ticket data
+                rag_cache[ticket_id] = {'status': 'open', 'responses': []}
+                
+            context = rag_cache[ticket_id]['responses']
+            graphrag_context = get_graphrag_context(ticket['description'])
+            context.append(graphrag_context)
+            
+            response = generate_response(ticket, context)
+            
+            if response:
+                reply_to_ticket(ticket_id, response)
+                rag_cache[ticket_id]['status'] = 'pending'
+                rag_cache[ticket_id]['responses'].append(response)
+        
+        logger.info("Sleeping for 60 seconds before the next check.")
+        time.sleep(60)  # Check for tickets every minute
+
+if __name__ == '__main__':
+    main_loop()
